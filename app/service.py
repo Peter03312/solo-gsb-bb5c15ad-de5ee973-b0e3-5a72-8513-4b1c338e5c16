@@ -1666,7 +1666,10 @@ class AuditService:
           仅距离严格小于阈值的**正时长**相遇区间可传递；
         - 源车在查询起点已到达；上游到达时刻早于某段相遇终点时，下游最早可在
           该段起点与上游到达时刻的较晚者到达，按不倒退的时间接续，可多跳；
-        - 返回每车最早可达时刻与一条车次链；同刻优先跳数少，再按车次 ID 序列排序；
+        - 每辆车保留全部**互不支配标号**（(到达时刻, 跳数) 分量序，同 (时刻,跳数)
+          按车次链字典序）：较早的多跳标号不淘汰其后等待直达的少跳标号——二者在
+          晚些的相遇段起点等待后可同刻接续到下游。返回每车的最优标号（最早可达
+          时刻；同刻跳数少；再按车次 ID 序列取较小链）；
           未可达明确标记（reachable=false，到达时刻与链为 null）。
         """
         if not isinstance(zone_id, str) or not zone_id.strip():
@@ -1780,36 +1783,62 @@ class AuditService:
                     adjacency.setdefault(tid_a, []).append((tid_b, intervals))
                     adjacency.setdefault(tid_b, []).append((tid_a, intervals))
 
-        # ---- 时间接续传播（类 Dijkstra 标号设定）----
+        # ---- 时间接续传播（多标号 Pareto 标号设定）----
         # 标号 = (最早到达时刻, 跳数, 车次链)；源车在查询起点已到达（0 跳）。
         # 边权由上游到达时刻决定：对相遇段 [s,e)，仅当到达 < e 时可在 max(到达,s) 到达
-        # 下游——时间不倒退的 FIFO 网络，按 (时刻, 跳数, 链序) 出队即为最优标号。
-        best: Dict[str, Tuple[float, int, Tuple[str, ...]]] = {
-            source: (lo, 0, (source,))
+        # 下游——时间不倒退（FIFO），且时间分量始终非减、跳数严格 +1。
+        # 关键：一辆车可能同时持有多条互不支配的标号。较早但多跳的标号并不支配
+        # 较晚但少跳的标号：在晚于后者的相遇段起点等待接续时两者同刻到达下游，
+        # 少跳标号取胜（源先经 B 到 A、稍后又直达 A，A 再遇 C 即此情形）。
+        # 支配偏序取 (到达时刻, 跳数) 的**分量序**：两维均不更大且不全等；
+        # t、h 全等时按车次链字典序（等长前缀字典序在任意相同后缀下序不变，
+        # 故每对 (t,h) 只留最小链）。标号按 (时刻, 跳数, 链) 全序出堆，
+        # FIFO 保证标号弹出时其可能的支配标号均已弹出，可安全松弛邻边；
+        # 环因跳数增加、时刻不倒退而必被分量支配，标号数有界、算法终止。
+        labels: Dict[str, List[Tuple[float, int, Tuple[str, ...]]]] = {
+            source: [(lo, 0, (source,))]
         }
         heap: List[Tuple[float, int, Tuple[str, ...], str]] = [(lo, 0, (source,), source)]
-        settled: set = set()
+
+        def _dominates(
+            lab: Tuple[float, int, Tuple[str, ...]],
+            other: Tuple[float, int, Tuple[str, ...]],
+        ) -> bool:
+            """lab 分量支配 other：到达时刻与跳数均不更大且不全等；
+            时刻、跳数全等时按车次链字典序（全等视为重复，丢弃后者）。"""
+            if lab[0] > other[0] or lab[1] > other[1]:
+                return False
+            return lab[0] < other[0] or lab[1] < other[1] or lab[2] <= other[2]
+
         while heap:
             t_arrive, hops, chain, tid = heapq.heappop(heap)
-            if tid in settled:
+            # 过期标号：已被同车支配标号淘汰（labels 中不存在）；仍在 labels 中
+            # 即尚未被支配——按 (时刻, 跳数, 链) 全序出堆，后生成的标号不可能
+            # 支配已弹出的，故每条有效标号只处理一次，无需单标号式定型集合。
+            if not any(
+                lab[0] == t_arrive and lab[1] == hops and lab[2] == chain
+                for lab in labels[tid]
+            ):
                 continue
-            settled.add(tid)
             for other, intervals in adjacency.get(tid, ()):
-                if other in settled:
-                    continue
                 # 相遇段按起点升序：首个终点晚于上游到达时刻的段给出最早可达时刻
                 ends = [e for _s, e in intervals]
                 pos = bisect.bisect_right(ends, t_arrive)
                 if pos >= len(intervals):
                     continue  # 上游到达不早于任何剩余相遇段的终点：不可经此边传递
                 cand_t = max(intervals[pos][0], t_arrive)
-                candidate = (cand_t, hops + 1, chain + (other,))
-                current = best.get(other)
-                if current is None or (candidate[0], candidate[1], candidate[2]) < current:
-                    best[other] = candidate
-                    heapq.heappush(
-                        heap, (candidate[0], candidate[1], candidate[2], other)
-                    )
+                cand = (cand_t, hops + 1, chain + (other,))
+                others = labels.setdefault(other, [])
+                if any(_dominates(lab, cand) for lab in others):
+                    continue  # 候选被现有标号分量支配，丢弃
+                others[:] = [lab for lab in others if not _dominates(cand, lab)]
+                others.append(cand)
+                heapq.heappush(heap, (cand[0], cand[1], cand[2], other))
+
+        # 每车取全序最小的保留标号：最早到达时刻；同刻跳数少，再按链字典序
+        best: Dict[str, Tuple[float, int, Tuple[str, ...]]] = {
+            tid: min(labs) for tid, labs in labels.items()
+        }
 
         results: List[Dict[str, Any]] = []
         for tid in trip_ids:

@@ -329,6 +329,96 @@ def test_request_trip_order_does_not_change_result(client):
 
 
 # ---------------------------------------------------------------------
+# 等待后接续：较早的多跳标号不得淘汰其后等待直达的少跳标号
+# ---------------------------------------------------------------------
+
+# 方形区 [0,100]² 全天、阈值 25、窗口 t∈[0,300)（t 为 10:00:00 起秒数）：
+#   S：(t,50) 1m/s 横穿 t∈[0,100]；
+#   B：t∈[0,40] 以 2m/s 沿 y=50 从 (0,50) 到 (80,50)，之后停 (80,50)；
+#      S-B 相遇 (0,25) 与 (55,100)；B-A 自 t=30（恰 25m，开）起持续；
+#   A：始终停在 (85,50)；S-A 直达相遇 (60,100)（t=60 恰 25m，开）；
+#   C：先停 (85,100)（区边界计入），t∈[60,70] 以 2.5m/s 到 (85,75)
+#      （t=70 恰距 A 25m），t∈[70,80] 到 (85,50)，t∈[80,90] 北返 (85,75)
+#      后停放；A-C 运动中正时长相遇 (70,80)，B-C 同段也在 (70,~78.6)，
+#      S-C 更晚（81 起）。
+# A 持有两条互不支配标号：(t=30, 2 跳 [S,B,A]) 与 (t=60, 1 跳 [S,A])；
+# 两者都在 A-C 段起点 t=70“等待后接续”，C 同刻 t=70 应取跳数少的 [S,A,C]。
+_WAIT_S = [
+    ("ws1", "2026-09-30T10:00:00Z", 0, 50),
+    ("ws2", "2026-09-30T10:01:40Z", 100, 50),
+]
+_WAIT_B = [
+    ("wb0", "2026-09-30T09:55:00Z", 0, 50),
+    ("wb1", "2026-09-30T10:00:00Z", 0, 50),
+    ("wb2", "2026-09-30T10:00:40Z", 80, 50),
+    ("wb3", "2026-09-30T10:10:00Z", 80, 50),
+]
+_WAIT_A = [
+    ("wa1", "2026-09-30T09:55:00Z", 85, 50),
+    ("wa2", "2026-09-30T10:10:00Z", 85, 50),
+]
+_WAIT_C = [
+    ("wc1", "2026-09-30T09:55:00Z", 85, 100),
+    ("wc2", "2026-09-30T10:01:00Z", 85, 100),
+    ("wc3", "2026-09-30T10:01:10Z", 85, 75),
+    ("wc4", "2026-09-30T10:01:20Z", 85, 50),
+    ("wc5", "2026-09-30T10:01:30Z", 85, 75),
+    ("wc6", "2026-09-30T10:10:00Z", 85, 75),
+]
+
+
+def test_wait_then_continue_keeps_later_fewer_hop_label(client):
+    """源先经 B 到达 A（t=30，2 跳），稍后又直达 A（t=60，1 跳）；A 再于 t=70
+    与 C 相遇时，两条标号等待后同刻接续到 C，须取跳数少的 [S,A,C]，
+    而不是沿用较早多跳链给出 [S,B,A,C]。"""
+    register_square(client, zone_id="ct-wait")
+    _upload(client, "S", _WAIT_S)
+    _upload(client, "B", _WAIT_B)
+    _upload(client, "A", _WAIT_A)
+    _upload(client, "C", _WAIT_C)
+    r = client.post("/api/v1/zones/ct-wait/contact-tracing", json={
+        "source_trip_id": "S",
+        "trip_ids": ["S", "B", "A", "C"],
+        "since": "2026-09-30T10:00:00Z",
+        "until": "2026-09-30T10:05:00Z",
+        "max_distance": 25,
+    })
+    assert r.status_code == 200, r.text
+    results = _result_map(r.json())
+    # A 的最早到达仍由较早多跳链给出：t=30，[S,B,A]
+    assert results["A"]["arrived_at"] == "2026-09-30T10:00:30Z"
+    assert results["A"]["hops"] == 2
+    assert results["A"]["chain"] == ["S", "B", "A"]
+    # C：A 的 (30,2 跳) 与 (60,1 跳) 标号在 A-C 段起点 70 等待后同刻到达
+    assert results["C"]["reachable"] is True
+    assert results["C"]["arrived_at"] == "2026-09-30T10:01:10Z"
+    assert results["C"]["hops"] == 2
+    assert results["C"]["chain"] == ["S", "A", "C"]
+
+
+def test_wait_then_continue_chain_lexicographic(client):
+    """等待后同刻、同跳数接续：两条 2 跳链按车次 ID 序列取较小链。
+    B 与 C 也自 t=70 相遇：[S,B,C] 与 [S,A,C] 同在 70 到达 C，
+    字典序 [S,A,C] < [S,B,C] 取胜（即使 [S,B,C] 由 B 的最早标号直接给出）。"""
+    register_square(client, zone_id="ct-wait-lex")
+    _upload(client, "S", _WAIT_S)
+    _upload(client, "B", _WAIT_B)
+    _upload(client, "A", _WAIT_A)
+    _upload(client, "C", _WAIT_C)
+    r = client.post("/api/v1/zones/ct-wait-lex/contact-tracing", json={
+        "source_trip_id": "S",
+        "trip_ids": ["S", "B", "A", "C"],
+        "since": "2026-09-30T10:00:00Z",
+        "until": "2026-09-30T10:05:00Z",
+        "max_distance": 25,
+    })
+    results = _result_map(r.json())
+    assert results["C"]["arrived_at"] == "2026-09-30T10:01:10Z"
+    assert results["C"]["hops"] == 2
+    assert results["C"]["chain"] == ["S", "A", "C"]
+
+
+# ---------------------------------------------------------------------
 # 规则沿用：严格小于阈值、洞、窗口、覆盖
 # ---------------------------------------------------------------------
 
