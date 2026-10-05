@@ -1668,6 +1668,8 @@ class AuditService:
           该段起点与上游到达时刻的较晚者到达，按不倒退的时间接续，可多跳；
         - 返回每车最早可达时刻与一条车次链；同刻优先跳数少，再按车次 ID 序列排序；
           未可达明确标记（reachable=false，到达时刻与链为 null）。
+          等待后接续的链路择优：每车保留帕累托标号组（较早多跳与较晚少跳/小链序
+          的标号都向下游接续），下游段起点抬升后同刻到达时按上述规则取最优链。
         """
         if not isinstance(zone_id, str) or not zone_id.strip():
             raise ValidationError("zone_id 必须是非空字符串")
@@ -1780,46 +1782,63 @@ class AuditService:
                     adjacency.setdefault(tid_a, []).append((tid_b, intervals))
                     adjacency.setdefault(tid_b, []).append((tid_a, intervals))
 
-        # ---- 时间接续传播（类 Dijkstra 标号设定）----
-        # 标号 = (最早到达时刻, 跳数, 车次链)；源车在查询起点已到达（0 跳）。
-        # 边权由上游到达时刻决定：对相遇段 [s,e)，仅当到达 < e 时可在 max(到达,s) 到达
-        # 下游——时间不倒退的 FIFO 网络，按 (时刻, 跳数, 链序) 出队即为最优标号。
-        best: Dict[str, Tuple[float, int, Tuple[str, ...]]] = {
-            source: (lo, 0, (source,))
-        }
+        # ---- 时间接续传播（多准则标号设定）----
+        # 标号 = (到达时刻, 跳数, 车次链)；源车在查询起点已到达（0 跳）。
+        # 边权由上游到达时刻决定：对相遇段 [s,e)，仅当到达 < e 时可在 max(到达,s)
+        # 到达下游——时间不倒退的 FIFO 网络。
+        # 每车不能只保留最早时刻的一条链：较晚到达但跳数更少（或链序更小）的标号，
+        # 经下游“相遇段起点”抬升后可能与较早多跳链同时刻到达且跳数更少
+        # （如 S 先经 B 到达 A、稍后又直接遇到 A，A 再遇 C 时，
+        # 直达链 S→A→C 与多跳链 S→B→A→C 同刻到达 C，应取跳数少的直达链）。
+        # 因此每车保留一组帕累托标号：(t0,h0,c0) 支配 (t,h,c) 当且仅当
+        # t0<=t 且 (h0<h 或 (h0==h 且 c0<=c))——被支配标号无论作为最终答案还是
+        # 继续向下游接续都不会更优，丢弃；其余按 (时刻,跳数,链序) 出队定居，
+        # 每车最终答案即其帕累托标号集合中的最小标号。
+        def _dominated(
+            settled_labels: List[Tuple[float, int, Tuple[str, ...]]],
+            candidate: Tuple[float, int, Tuple[str, ...]],
+        ) -> bool:
+            """已定居标号中是否存在支配 candidate 的标号（定义见上）。"""
+            t, h, c = candidate
+            return any(
+                t0 <= t and (h0 < h or (h0 == h and c0 <= c))
+                for t0, h0, c0 in settled_labels
+            )
+
+        labels: Dict[str, List[Tuple[float, int, Tuple[str, ...]]]] = {}
         heap: List[Tuple[float, int, Tuple[str, ...], str]] = [(lo, 0, (source,), source)]
-        settled: set = set()
         while heap:
             t_arrive, hops, chain, tid = heapq.heappop(heap)
-            if tid in settled:
-                continue
-            settled.add(tid)
+            settled_labels = labels.get(tid)
+            if settled_labels is not None and _dominated(
+                settled_labels, (t_arrive, hops, chain)
+            ):
+                continue  # 被同车已定居标号支配：丢弃
+            labels.setdefault(tid, []).append((t_arrive, hops, chain))
             for other, intervals in adjacency.get(tid, ()):
-                if other in settled:
-                    continue
                 # 相遇段按起点升序：首个终点晚于上游到达时刻的段给出最早可达时刻
                 ends = [e for _s, e in intervals]
                 pos = bisect.bisect_right(ends, t_arrive)
                 if pos >= len(intervals):
                     continue  # 上游到达不早于任何剩余相遇段的终点：不可经此边传递
-                cand_t = max(intervals[pos][0], t_arrive)
-                candidate = (cand_t, hops + 1, chain + (other,))
-                current = best.get(other)
-                if current is None or (candidate[0], candidate[1], candidate[2]) < current:
-                    best[other] = candidate
-                    heapq.heappush(
-                        heap, (candidate[0], candidate[1], candidate[2], other)
-                    )
+                candidate = (max(intervals[pos][0], t_arrive), hops + 1, chain + (other,))
+                other_labels = labels.get(other)
+                if other_labels is not None and _dominated(other_labels, candidate):
+                    continue  # 已被对方定居标号支配的候选不必入堆
+                heapq.heappush(
+                    heap, (candidate[0], candidate[1], candidate[2], other)
+                )
 
         results: List[Dict[str, Any]] = []
         for tid in trip_ids:
-            label = best.get(tid)
-            if label is None:
+            trip_labels = labels.get(tid)
+            if not trip_labels:
                 results.append(
                     {"trip_id": tid, "reachable": False, "arrived_at": None, "hops": None, "chain": None}
                 )
             else:
-                arrived, hops, chain = label
+                # 最小标号：先最早时刻，同刻跳数少，再按车次 ID 序列字典序
+                arrived, hops, chain = min(trip_labels)
                 results.append(
                     {
                         "trip_id": tid,

@@ -328,6 +328,96 @@ def test_request_trip_order_does_not_change_result(client):
     assert [row["trip_id"] for row in r2.json()["results"]] == ["B", "S", "A"]
 
 
+def test_wait_then_direct_fewer_hops_same_arrival(client):
+    """等待后接续：源车先经 B 到达 A（较早、2 跳），稍后又直接遇到 A（较晚、1 跳），
+    A 再遇 C 时两链同刻到达 C —— C 须取同刻跳数少的 [S,A,C]，而非沿 A 较早
+    多跳链的 [S,B,A,C]；A 自身仍保留最早时刻的多跳链。
+
+    相遇区间（t 为 10:00:00 起秒数，阈值 25）：
+      S-B [0,300)：S 静止 (0,0)、B 静止 (10,0)，相距 10m；
+      B-A [5,300)：A 前段静止 (30,0) 距 B 20m → A 经 S→B→A 于 t=5 到达（2 跳）；
+      S-A (16.67,300)：A 于 [15,20] 移到 (15,0)，距 S<25 始于 x=25 → 直达 1 跳但更晚；
+      A-C [25,40)：C 静止 (36,0) 距 A 末位 21m；C 与 S(36m)/B(26m) 均不相遇。
+    """
+    register_square(client, zone_id="ct9b")
+    _upload(client, "S", [
+        ("s1", "2026-09-30T10:00:00Z", 0, 0),
+        ("s2", "2026-09-30T10:05:00Z", 0, 0),
+    ])
+    _upload(client, "B", [
+        ("b1", "2026-09-30T10:00:00Z", 10, 0),
+        ("b2", "2026-09-30T10:05:00Z", 10, 0),
+    ])
+    _upload(client, "A", [
+        ("a1", "2026-09-30T10:00:05Z", 30, 0),
+        ("a2", "2026-09-30T10:00:15Z", 30, 0),
+        ("a3", "2026-09-30T10:00:20Z", 15, 0),
+        ("a4", "2026-09-30T10:05:00Z", 15, 0),
+    ])
+    _upload(client, "C", [
+        ("c1", "2026-09-30T10:00:25Z", 36, 0),
+        ("c2", "2026-09-30T10:00:40Z", 36, 0),
+    ])
+    r = _ask(client, "ct9b", trip_ids=["S", "A", "B", "C"])
+    assert r.status_code == 200, r.text
+    results = _result_map(r.json())
+    # A 的最早到达仍是经 B 的多跳链（时刻最早优先）
+    assert results["A"]["arrived_at"] == "2026-09-30T10:00:05Z"
+    assert results["A"]["hops"] == 2
+    assert results["A"]["chain"] == ["S", "B", "A"]
+    # C：两链同刻（段起点 25 抬升），取跳数少的直达链
+    assert results["C"]["arrived_at"] == "2026-09-30T10:00:25Z"
+    assert results["C"]["hops"] == 2
+    assert results["C"]["chain"] == ["S", "A", "C"]
+
+
+def test_wait_then_lexicographically_smaller_chain(client):
+    """等待后接续的链序决胜：A 较早经 D 到达（2 跳链 [S,D,A]），较晚经 B 到达
+    （同为 2 跳但链序更小 [S,B,A]，B<D）；A 再遇 C 时两链同刻同跳数到达 C，
+    须取车次 ID 序列较小的 [S,B,A,C]。
+
+    相遇区间（t 为 10:00:00 起秒数，阈值 25）：
+      S-D、S-B [0,300)：D 静止 (10,0)、B 静止 (0,24)，距 S 分别为 10m、24m；
+      D-A [5,27.2)：A 前段静止 (30,0) 距 D 20m → A 经 S→D→A 于 t=5 到达；
+      B-A (23.8,300)：A 于 [20,30] 移到 (10,34)（全程距 S 最近约 25.9m，不相遇），
+        距 B(0,24) 进入 25m 始于 t≈23.8 → 同跳数但更晚；
+      A-C [30,60)：C 静止 (10,50) 距 A 末位 16m；C 与 S/B/D 均不相遇。
+    """
+    register_square(client, zone_id="ct9c")
+    _upload(client, "S", [
+        ("s1", "2026-09-30T10:00:00Z", 0, 0),
+        ("s2", "2026-09-30T10:05:00Z", 0, 0),
+    ])
+    _upload(client, "D", [
+        ("d1", "2026-09-30T10:00:00Z", 10, 0),
+        ("d2", "2026-09-30T10:05:00Z", 10, 0),
+    ])
+    _upload(client, "B", [
+        ("b1", "2026-09-30T10:00:00Z", 0, 24),
+        ("b2", "2026-09-30T10:05:00Z", 0, 24),
+    ])
+    _upload(client, "A", [
+        ("a1", "2026-09-30T10:00:05Z", 30, 0),
+        ("a2", "2026-09-30T10:00:20Z", 30, 0),
+        ("a3", "2026-09-30T10:00:30Z", 10, 34),
+        ("a4", "2026-09-30T10:05:00Z", 10, 34),
+    ])
+    _upload(client, "C", [
+        ("c1", "2026-09-30T10:00:30Z", 10, 50),
+        ("c2", "2026-09-30T10:01:00Z", 10, 50),
+    ])
+    r = _ask(client, "ct9c", trip_ids=["S", "A", "B", "C", "D"])
+    assert r.status_code == 200, r.text
+    results = _result_map(r.json())
+    assert results["A"]["arrived_at"] == "2026-09-30T10:00:05Z"
+    assert results["A"]["hops"] == 2
+    assert results["A"]["chain"] == ["S", "D", "A"]
+    # C：同刻（段起点 30）同跳数，取链序较小的 [S,B,A,C]
+    assert results["C"]["arrived_at"] == "2026-09-30T10:00:30Z"
+    assert results["C"]["hops"] == 3
+    assert results["C"]["chain"] == ["S", "B", "A", "C"]
+
+
 # ---------------------------------------------------------------------
 # 规则沿用：严格小于阈值、洞、窗口、覆盖
 # ---------------------------------------------------------------------
